@@ -1,0 +1,11 @@
+# credentials must never be committed - the scanner reads them from env only
+angel_config.json
+.env
+.env.*
+secrets.json
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store

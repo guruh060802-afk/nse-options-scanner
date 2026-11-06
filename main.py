@@ -492,6 +492,20 @@ def gates(c):
     return bad
 
 
+BLOCKER_LABELS = ("lot size", "cost", "delta", "theta", "spread", "OI",
+                  "volume", "sessions", "EMA stack", "chain", "depth",
+                  "risk-reward", "only")
+
+
+def blocker_key(reason):
+    """Collapse a gate message to a stable short label for tallying."""
+    low = reason.lower()
+    for label in BLOCKER_LABELS:
+        if low.startswith(label.lower()):
+            return "sessions" if label == "only" else label
+    return reason.split()[0]
+
+
 def score(c):
     """Composite quality score, 0-1. Ranking only; it is not a probability."""
     delta_fit = max(0.0, 1.0 - abs(abs(c["delta"]) - TARGET_DELTA) / 0.35)
@@ -618,7 +632,7 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     else:
                         tot_pe += oi
 
-        passing, rejected = [], 0
+        passing, rejected, blockers = [], 0, {}
         for row in rows:
             strike = row.get("strikePrice")
             if not strike or abs(strike - spot) / spot > STRIKE_WINDOW:
@@ -639,9 +653,9 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 trend_ok = False
                 if ind:
                     if side == "CE":
-                        trend_ok = spot > ind["ema_fast"] > ind["ema_slow"]
+                        trend_ok = spot > ind["ema_fast"] and spot > ind["ema_slow"]
                     else:
-                        trend_ok = spot < ind["ema_fast"] < ind["ema_slow"]
+                        trend_ok = spot < ind["ema_fast"] and spot < ind["ema_slow"]
                 opp = row.get("PE" if side == "CE" else "CE", {})
                 c = {
                     "symbol": symbol, "side": side, "strike": strike,
@@ -662,6 +676,9 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 bad = gates(c)
                 if bad:
                     rejected += 1
+                    for reason in bad:
+                        key = blocker_key(reason)
+                        blockers[key] = blockers.get(key, 0) + 1
                     continue
                 lv = build_levels(premium, (ind or {}).get("atr") or 0,
                                   g["delta"], g["theta"], sessions)
@@ -682,25 +699,33 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
             "expiry": expiry, "sessions": sessions, "lot": lot,
             "lot_note": lot_note,
             "pcr": round(tot_pe / tot_ce, 2) if tot_ce else 0.0,
-            "support": top_strike(rows, "PE"), "resistance": top_strike(rows, "CE"),
+            "resistance": top_strike(rows, "CE"),
+            "support": top_strike(rows, "PE", exclude=top_strike(rows, "CE")),
             "atr": (ind or {}).get("atr"), "ema_fast": (ind or {}).get("ema_fast"),
             "ema_slow": (ind or {}).get("ema_slow"), "candle_source": source,
             "bars": (ind or {}).get("bars"), "angel_xcheck_pct": xcheck,
             "scanned": len(passing) + rejected, "rejected": rejected,
+            "blockers": sorted(blockers.items(), key=lambda kv: -kv[1])[:3],
         })
         setups += passing
 
     return contexts, setups, notes
 
 
-def top_strike(rows, side):
-    best = (0, None)
+def top_strike(rows, side, exclude=None):
+    """Highest-OI strike on a side. `exclude` avoids printing the same level twice."""
+    ranked = []
     for row in rows:
         if side in row:
             oi = row[side].get("openInterest", 0) or 0
-            if oi > best[0]:
-                best = (oi, row.get("strikePrice"))
-    return best[1]
+            strike = row.get("strikePrice")
+            if oi > 0 and strike:
+                ranked.append((oi, strike))
+    ranked.sort(reverse=True)
+    for _, strike in ranked:
+        if strike != exclude:
+            return strike
+    return ranked[0][1] if ranked else None
 
 
 # ------------------------------------------------------------------ telegram
@@ -758,29 +783,40 @@ def render(results, budget, core, notes, vix, blocked):
     lines = ["<b>NSE option-buying scan</b>  %s" % now.strftime("%d-%b-%Y %H:%M IST")]
     if vix is not None:
         lines.append("India VIX %s" % vix)
-    lines.append("")
 
+    by_symbol = {}
     for r in results:
-        c = r["context"]
-        stack = ""
-        if c["ema_fast"] and c["ema_slow"]:
-            stack = " | EMA20 %s EMA50 %s" % (c["ema_fast"], c["ema_slow"])
-        lines.append("<b>%s</b> %s   PCR %s   S %s / R %s"
-                     % (esc(c["symbol"]), esc("{:,.2f}".format(c["spot"])),
-                        c["pcr"], c["support"], c["resistance"]))
-        lines.append("chain %s | exp %s (%d sessions) | lot %s | ATR %s%s"
-                     % (esc(c["stamp"]), esc(c["expiry"]), c["sessions"],
-                        c["lot"], c["atr"], stack))
-        lines.append("candles %s (%s bars) | scanned %d, passed %d"
-                     % (esc(c["candle_source"]), c["bars"], c["scanned"],
-                        c["scanned"] - c["rejected"]))
-        if c["angel_xcheck_pct"] is not None:
-            lines.append("Angel vs NSE spot: %+.3f%%" % c["angel_xcheck_pct"])
+        by_symbol.setdefault(r["context"]["symbol"], []).append(r["context"])
+
+    for symbol, ctxs in by_symbol.items():
+        head = ctxs[0]
+        expiries = " + ".join("%s (%d)" % (c["expiry"], c["sessions"]) for c in ctxs)
+        scanned = sum(c["scanned"] for c in ctxs)
+        passed = sum(c["scanned"] - c["rejected"] for c in ctxs)
         lines.append("")
+        lines.append("<b>%s</b> %s   PCR %s   S %s / R %s"
+                     % (esc(symbol), esc("{:,.2f}".format(head["spot"])),
+                        head["pcr"], head["support"], head["resistance"]))
+        lines.append("  %s | lot %s | ATR %s | %s | scanned %d, passed %d"
+                     % (esc(expiries), head["lot"], head["atr"],
+                        esc(head["candle_source"]), scanned, passed))
+        if head["angel_xcheck_pct"] is not None:
+            lines.append("  Angel vs NSE spot %+.3f%% | chain %s"
+                         % (head["angel_xcheck_pct"], esc(head["stamp"])))
+        if not passed:
+            agg = {}
+            for c in ctxs:
+                for key, n in c.get("blockers", []):
+                    agg[key] = agg.get(key, 0) + n
+            if agg:
+                top = sorted(agg.items(), key=lambda kv: -kv[1])[:3]
+                lines.append("  blocked by: %s"
+                             % ", ".join("%s %d" % (k, v) for k, v in top))
 
     def block(title, rows):
         if not rows:
             return
+        lines.append("")
         lines.append("<b>%s</b>" % title)
         for s in rows:
             lv = s["levels"]
@@ -791,7 +827,7 @@ def render(results, budget, core, notes, vix, blocked):
             lines.append("Entry %s | SL %s | T1 %s (%.2fR) | T2 %s (%.2fR)"
                          % (lv["entry"], lv["sl"], lv["t1"], lv["t1_rr"],
                             lv["t2"], lv["t2_rr"]))
-            lines.append("Cost Rs %s = %s x %d | risk Rs %s/lot"
+            lines.append("Cost Rs %s = %s x %d | risk Rs %s per lot"
                          % (int(s["cost"]), s["premium"], s["lot"],
                             int(round(lv["risk"] * s["lot"]))))
             lines.append("delta %.3f | theta %.2f/day | IV %.1f | spread %.2f%%"
@@ -799,18 +835,17 @@ def render(results, budget, core, notes, vix, blocked):
             lines.append("OI %s | dOI %+d | vol %s | score %.2f"
                          % ("{:,}".format(s["oi"]), s["chg_oi_own"],
                             "{:,}".format(s["volume"]), s["score"]))
-            lines.append("")
 
     if blocked:
+        lines.append("")
         lines.append("<b>No setups published.</b> %s" % esc(blocked))
     else:
         block("Budget tier  Rs %d-%d per lot" % (BUDGET_MIN, BUDGET_MAX), budget)
         block("Core tier  above budget, under Rs %d" % CORE_MAX_COST, core)
         if not budget and not core:
-            lines.append("<b>No qualifying setup today.</b> Every contract failed "
-                         "at least one gate: delta, theta, spread, OI, volume, "
-                         "sessions left, EMA stack, depth, stop width, or chain "
-                         "confirmation.")
+            lines.append("")
+            lines.append("<b>No qualifying setup today.</b> Nothing cleared every "
+                         "gate. The blockers above are the reason.")
 
     if notes:
         lines.append("")

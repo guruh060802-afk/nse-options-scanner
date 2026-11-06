@@ -1,29 +1,45 @@
 name: Daily NSE Derivatives Scan
 
+# GitHub's scheduler is best-effort: it queues, delays and occasionally drops
+# runs. A single daily trigger at 09:00 IST is intentional - it builds the plan
+# from the previous close, before the open. Verify the chain timestamp in the
+# alert before acting on it.
 on:
   schedule:
-    # 03:30 UTC = 09:00 AM IST (Monday to Friday)
-    - cron: '30 3 * * 1-5'
-  workflow_dispatch: # Allows manual trigger anytime
+    - cron: '30 3 * * 1-5'          # 03:30 UTC = 09:00 IST, Mon-Fri
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print only, do not send to Telegram'
+        type: boolean
+        default: false
+
+# Least privilege. The scanner only reads; it has no write access to this repo.
+permissions:
+  contents: read
+
+# Never let two runs overlap and double-post.
+concurrency:
+  group: nse-scan
+  cancel-in-progress: false
 
 jobs:
-  run-scan:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Run NSE Derivatives Scanner
+      - name: Run scanner
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
@@ -31,5 +47,5 @@ jobs:
           ANGEL_TOTP_KEY: ${{ secrets.ANGEL_TOTP_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python main.py
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python main.py

@@ -1,12 +1,13 @@
 name: Daily NSE Derivatives Scan
 
 # GitHub's scheduler is best-effort: it queues, delays and occasionally drops
-# runs. A single daily trigger at 09:00 IST is intentional - it builds the plan
-# from the previous close, before the open. Verify the chain timestamp in the
+# runs. A single daily trigger at 20:00 IST is intentional - it builds the plan
+# from the close of that same session, thirteen hours before the next open,
+# so there is time to study the setups. Verify the chain timestamp in the
 # alert before acting on it.
 on:
   schedule:
-    - cron: '30 3 * * 1-5'          # 03:30 UTC = 09:00 IST, Mon-Fri
+    - cron: '30 14 * * 1-5'         # 14:30 UTC = 20:00 IST, Mon-Fri (same day)
   workflow_dispatch:
     inputs:
       dry_run:

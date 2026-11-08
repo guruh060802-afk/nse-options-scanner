@@ -62,7 +62,7 @@ MIN_DTE, MAX_DTE = 31, 60               # the only expiry band with positive exp
 WIDE_DTE, WIDE_MAX_DTE = 21, 90         # fallback band when nothing sits in the above
 MAX_RISK_FRAC = 0.55                    # ATR stop may not exceed this share of premium
 IV_RV_MAX = 1.05                        # pay no more than 5% over realised volatility
-MAX_SPREAD_PCT = 5.0
+MAX_SPREAD_PCT = 1.0                    # the edge is 1-2% of premium; a wider toll kills it
 MIN_OI = 100
 MIN_VOLUME_INDEX, MIN_VOLUME_STOCK = 500, 100
 STRIKE_WINDOW = 0.06
@@ -569,7 +569,7 @@ def universe_from_lot_file(lot_file):
     seen, out = set(), []
     for row in lot_file["rows"]:
         sym = (row.get("SYMBOL") or "").strip().upper()
-        if not sym or sym in seen:
+        if not sym or sym in seen or sym in ("SYMBOL", "UNDERLYING"):
             continue
         seen.add(sym)
         out.append((sym, sym in INDEX_NAMES))

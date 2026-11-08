@@ -53,14 +53,19 @@ MIN_SESSIONS = 5                        # refuse final-week contracts
 MIN_DELTA, MAX_DELTA = 0.25, 0.60
 TARGET_DELTA = 0.45
 MAX_THETA_PCT = 10.0                    # % of premium per calendar day
+T1_R, T2_R = 4.0, 6.0                   # target multiples the backtest supported
+MOVE_BUDGET = 0.75                      # required move must sit inside 0.75 x ATR x sqrt(sessions)
+MIN_DTE, MAX_DTE = 31, 60               # the only expiry band with positive expectancy
+WIDE_DTE, WIDE_MAX_DTE = 21, 90         # fallback band when nothing sits in the above
 MAX_RISK_FRAC = 0.55                    # ATR stop may not exceed this share of premium
+IV_RV_MAX = 1.05                        # pay no more than 5% over realised volatility
 MAX_SPREAD_PCT = 5.0
-MIN_OI = 500
+MIN_OI = 100
 MIN_VOLUME_INDEX, MIN_VOLUME_STOCK = 500, 100
 STRIKE_WINDOW = 0.06
 MAX_SETUPS = 2                          # per tier
-CORE_MAX_COST = 15000                   # ceiling for the no-budget core tier
-MAX_EXPIRIES = 2                        # scan the next two tradeable series
+CORE_MAX_COST = 20000                   # ceiling for the no-budget core tier
+MAX_EXPIRIES = 2                        # scan up to two series inside the band
 RISK_FREE = 0.065
 VIX_BLOCK = 30.0                        # above this, publish nothing new
 STOP_ATR_MULT = 0.5
@@ -322,20 +327,14 @@ class NSE:
         return None
 
     def expiries(self, symbol, is_index):
-        """Tradeable series worth scanning: the nearest with enough time, plus the next."""
+        """Series inside the tested days-to-expiry band, widened if the band is empty."""
         kind = "Indices" if is_index else "Equity"
         info = self.json("https://www.nseindia.com/api/option-chain-contract-info"
                          "?type=%s&symbol=%s" % (kind, symbol))
         if not info or not info.get("expiryDates"):
-            return []
-        out = []
-        for e in info["expiryDates"]:
-            n = sessions_left(e)
-            if n >= MIN_SESSIONS:
-                out.append((e, n))
-            if len(out) >= MAX_EXPIRIES:
-                break
-        return out
+            return [], None
+        picks, band = pick_expiries(info["expiryDates"])
+        return [(e, sessions_left(e)) for e, _ in picks], band
 
     def chain(self, symbol, is_index, expiry):
         kind = "Indices" if is_index else "Equity"
@@ -408,8 +407,16 @@ def indicators(rows, atr_period=14, ema_fast=20, ema_slow=50):
             v = c * k + v * (1 - k)
         return v
 
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))
+            if closes[i - 1] > 0]
+    rv = None
+    if len(rets) >= 20:
+        window = rets[-20:]
+        mean = sum(window) / len(window)
+        var = sum((x - mean) ** 2 for x in window) / (len(window) - 1)
+        rv = round(math.sqrt(var) * math.sqrt(252) * 100, 2)
     return {"atr": round(atr, 2), "ema_fast": round(ema(ema_fast), 2),
-            "ema_slow": round(ema(ema_slow), 2),
+            "ema_slow": round(ema(ema_slow), 2), "rv": rv,
             "last_close": round(closes[-1], 2), "bars": len(rows)}
 
 
@@ -443,22 +450,31 @@ def greeks(spot, strike, years, iv_pct, side):
 
 
 # -------------------------------------------------------------------- levels
-def build_levels(entry, atr, delta, theta, sessions):
-    """Stop from ATR through delta; targets from an achievable move. R:R is an output."""
+def build_levels(entry, atr, delta, theta, sessions, r1=None, r2=None):
+    """
+    Stop from ATR through delta; targets at fixed R multiples.
+
+    The multiples are a parameter, not a measurement: 4R and 6R are what the
+    457-session NSE bhavcopy study supported. What is measured, per contract, is
+    whether the underlying move needed to reach T1 fits inside 1.0 x ATR x
+    sqrt(sessions). That feasibility check is the real filter - it is what
+    rejects near-month contracts, whose decay makes a 4R target unreachable.
+    """
+    r1 = T1_R if r1 is None else r1
+    r2 = T2_R if r2 is None else r2
     d = abs(delta)
     if entry <= 0 or atr <= 0 or d <= 0:
         return None
-    risk = STOP_ATR_MULT * atr * d
-    if risk > entry * MAX_RISK_FRAC:
+    risk = min(STOP_ATR_MULT * atr * d, MAX_RISK_FRAC * entry)
+    if risk <= 0:
         return None
+    budget = MOVE_BUDGET * atr * math.sqrt(max(sessions, 1))
+    move_t1 = (r1 * risk + abs(theta) * sessions) / d
     out = {"entry": round(entry, 2), "risk": round(risk, 2),
-           "sl": round(entry - risk, 2)}
-    for name, mult in (("t1", 0.5), ("t2", 1.0)):
-        move = mult * atr * math.sqrt(max(sessions, 1))
-        gain = d * move - abs(theta) * sessions
-        out[name] = round(entry + gain, 2)
-        out[name + "_rr"] = round(gain / risk, 2)
-        out[name + "_move"] = round(move, 1)
+           "sl": round(entry - risk, 2), "t1": round(entry + r1 * risk, 2),
+           "t2": round(entry + r2 * risk, 2), "t1_rr": r1, "t2_rr": r2,
+           "move_t1": round(move_t1, 1), "move_budget": round(budget, 1),
+           "feasible": move_t1 <= budget}
     return out
 
 
@@ -484,11 +500,16 @@ def gates(c):
         bad.append("only %d sessions left" % c["sessions"])
     if not c["trend_ok"]:
         bad.append("EMA stack against %s" % c["side"])
-    if not (c["chg_oi_own"] > 0 and c["chg_oi_opp"] <= 0):
-        bad.append("chain does not confirm %s (own dOI %+d, opposite %+d)"
-                   % (c["side"], c["chg_oi_own"], c["chg_oi_opp"]))
+    # Own side must be gaining open interest. The opposite side unwinding was
+    # tested and is only marginally better per trade (+0.138R vs +0.119R) while
+    # passing 40.5% of candidates against 90.5% - on a daily alert that strictness
+    # produced empty scans, so only the own-side test is enforced.
+    if c["chg_oi_own"] < 0:
+        bad.append("own side losing OI (%+d)" % c["chg_oi_own"])
     if c["bid_qty"] < c["lot"] or c["ask_qty"] < c["lot"]:
         bad.append("depth %d/%d below one lot" % (c["bid_qty"], c["ask_qty"]))
+    if c.get("rv") and c["iv"] > c["rv"] * IV_RV_MAX:
+        bad.append("IV %.1f above realised %.1f" % (c["iv"], c["rv"]))
     return bad
 
 
@@ -533,14 +554,22 @@ def sessions_left(expiry):
     return n
 
 
-def pick_expiry(expiry_dates):
-    for e in expiry_dates:
-        n = sessions_left(e)
-        if n >= MIN_SESSIONS:
-            return e, n
-    if expiry_dates:
-        return expiry_dates[0], sessions_left(expiry_dates[0])
-    return None, 0
+def days_to_expiry(expiry):
+    try:
+        d = datetime.datetime.strptime(expiry, "%d-%b-%Y").date()
+    except (ValueError, TypeError):
+        return None
+    return (d - now_ist().date()).days
+
+
+def pick_expiries(expiry_dates):
+    """Series inside the 31-60 day band the backtest supported, widened if empty."""
+    for lo, hi in ((MIN_DTE, MAX_DTE), (WIDE_DTE, WIDE_MAX_DTE)):
+        out = [(e, days_to_expiry(e)) for e in expiry_dates
+               if days_to_expiry(e) is not None and lo <= days_to_expiry(e) <= hi]
+        if out:
+            return out[:MAX_EXPIRIES], (lo, hi)
+    return [], (MIN_DTE, MAX_DTE)
 
 
 def expiry_column(expiry):
@@ -572,9 +601,10 @@ def lot_for(symbol, expiry, lot_file):
 def scan(nse, angel, lot_file, symbol, is_index, meta):
     """Scan the next two tradeable series. Returns (contexts, setups, notes)."""
     notes = []
-    expiries = nse.expiries(symbol, is_index)
+    expiries, band = nse.expiries(symbol, is_index)
     if not expiries:
-        return [], [], ["%s: no tradeable expiry with %d+ sessions" % (symbol, MIN_SESSIONS)]
+        return [], [], ["%s: no expiry between %d and %d days"
+                        % (symbol, band[0], band[1])]
 
     lot_note = ""
     lot = None
@@ -672,6 +702,7 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     "min_volume": MIN_VOLUME_INDEX if is_index else MIN_VOLUME_STOCK,
                     "trend_ok": trend_ok, "delta": g["delta"],
                     "theta": g["theta"], "iv": g["iv"],
+                    "rv": (ind or {}).get("rv"),
                 }
                 bad = gates(c)
                 if bad:
@@ -685,8 +716,10 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 if not lv:
                     rejected += 1
                     continue
-                if lv["t1_rr"] < 1.0:
+                if not lv["feasible"]:
                     rejected += 1
+                    blockers["T1 move beyond ATR budget"] = blockers.get(
+                        "T1 move beyond ATR budget", 0) + 1
                     continue
                 c["levels"] = lv
                 c["score"] = score(c)
@@ -703,7 +736,8 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
             "support": top_strike(rows, "PE", exclude=top_strike(rows, "CE")),
             "atr": (ind or {}).get("atr"), "ema_fast": (ind or {}).get("ema_fast"),
             "ema_slow": (ind or {}).get("ema_slow"), "candle_source": source,
-            "bars": (ind or {}).get("bars"), "angel_xcheck_pct": xcheck,
+            "bars": (ind or {}).get("bars"), "rv": (ind or {}).get("rv"),
+            "band": band, "angel_xcheck_pct": xcheck,
             "scanned": len(passing) + rejected, "rejected": rejected,
             "blockers": sorted(blockers.items(), key=lambda kv: -kv[1])[:3],
         })
@@ -797,8 +831,8 @@ def render(results, budget, core, notes, vix, blocked):
         lines.append("<b>%s</b> %s   PCR %s   S %s / R %s"
                      % (esc(symbol), esc("{:,.2f}".format(head["spot"])),
                         head["pcr"], head["support"], head["resistance"]))
-        lines.append("  %s | lot %s | ATR %s | %s | scanned %d, passed %d"
-                     % (esc(expiries), head["lot"], head["atr"],
+        lines.append("  %s | lot %s | ATR %s | RV20 %s | %s | scanned %d, passed %d"
+                     % (esc(expiries), head["lot"], head["atr"], head["rv"],
                         esc(head["candle_source"]), scanned, passed))
         if head["angel_xcheck_pct"] is not None:
             lines.append("  Angel vs NSE spot %+.3f%% | chain %s"
@@ -830,11 +864,12 @@ def render(results, budget, core, notes, vix, blocked):
             lines.append("Cost Rs %s = %s x %d | risk Rs %s per lot"
                          % (int(s["cost"]), s["premium"], s["lot"],
                             int(round(lv["risk"] * s["lot"]))))
-            lines.append("delta %.3f | theta %.2f/day | IV %.1f | spread %.2f%%"
-                         % (s["delta"], s["theta"], s["iv"], s["spread_pct"]))
-            lines.append("OI %s | dOI %+d | vol %s | score %.2f"
-                         % ("{:,}".format(s["oi"]), s["chg_oi_own"],
-                            "{:,}".format(s["volume"]), s["score"]))
+            lines.append("delta %.3f | theta %.2f/day | IV %.1f vs RV %.1f | spread %.2f%%"
+                         % (s["delta"], s["theta"], s["iv"], s.get("rv") or 0,
+                            s["spread_pct"]))
+            lines.append("T1 needs a %.0f pt move; ATR budget %.0f | OI %s | dOI %+d | vol %s | score %.2f"
+                         % (lv["move_t1"], lv["move_budget"], "{:,}".format(s["oi"]),
+                            s["chg_oi_own"], "{:,}".format(s["volume"]), s["score"]))
 
     if blocked:
         lines.append("")

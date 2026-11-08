@@ -62,7 +62,7 @@ MIN_DTE, MAX_DTE = 31, 60               # the only expiry band with positive exp
 WIDE_DTE, WIDE_MAX_DTE = 21, 90         # fallback band when nothing sits in the above
 MAX_RISK_FRAC = 0.55                    # ATR stop may not exceed this share of premium
 IV_RV_MAX = 1.05                        # pay no more than 5% over realised volatility
-MAX_SPREAD_PCT = 1.0                    # the edge is 1-2% of premium; a wider toll kills it
+MAX_SPREAD_PCT = 5.0                    # widened back: pre-open quotes are stale and look wide
 MIN_OI = 100
 MIN_VOLUME_INDEX, MIN_VOLUME_STOCK = 500, 100
 STRIKE_WINDOW = 0.06
@@ -737,6 +737,10 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 core_ok = MIN_DTE <= dte <= MAX_DTE and c["cost"] > BUDGET_MAX
                 budget_ok = BUDGET_MIN <= c["cost"] <= BUDGET_MAX and dte >= MIN_DTE_BUDGET
                 if not (core_ok or budget_ok):
+                    k = ("too cheap for budget" if c["cost"] < BUDGET_MIN
+                         else "wrong dte for core" if c["cost"] > BUDGET_MAX
+                         else "outside tiers")
+                    blockers["tier:" + k] = blockers.get("tier:" + k, 0) + 1
                     continue
                 lv = build_levels(premium, (ind or {}).get("atr") or 0,
                                   g["delta"], g["theta"], sessions)

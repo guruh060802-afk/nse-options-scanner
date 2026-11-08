@@ -77,6 +77,9 @@ MIN_DTE_BUDGET = 8                      # budget tier cannot reach 31-60 days
 # base rates for the filter combination, NOT predictions for any single trade.
 HIT_CORE = (18.7, 1378)
 HIT_BUDGET = (15.0, 4882)
+HIT_SHORT = (16.2, 7788)                # mean result -0.157R: a losing class
+NEAR_DTE_MIN, NEAR_DTE_MAX = 8, 30      # the gap between the two tiers
+NEAR_MAX_COST = 16000
 CORE_MAX_COST = 20000                   # ceiling for the no-budget core tier
 MAX_EXPIRIES = 2                        # scan up to two series inside the band
 RISK_FREE = 0.065
@@ -747,7 +750,9 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     continue
                 core_ok = MIN_DTE <= dte <= MAX_DTE and c["cost"] > BUDGET_MAX
                 budget_ok = BUDGET_MIN <= c["cost"] <= BUDGET_MAX and dte >= MIN_DTE_BUDGET
-                if not (core_ok or budget_ok):
+                short_ok = (NEAR_DTE_MIN <= dte <= NEAR_DTE_MAX
+                            and BUDGET_MAX < c["cost"] <= NEAR_MAX_COST)
+                if not (core_ok or budget_ok or short_ok):
                     k = ("too cheap for budget" if c["cost"] < BUDGET_MIN
                          else "wrong dte for core" if c["cost"] > BUDGET_MAX
                          else "outside tiers")
@@ -755,10 +760,12 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     continue
                 lv = build_levels(premium, (ind or {}).get("atr") or 0,
                                   g["delta"], g["theta"], sessions)
-                if not lv or not lv["feasible"]:
+                if not lv:
+                    continue
+                if not lv["feasible"] and not short_ok:
                     continue
                 c.update({"levels": lv, "sl": lv["sl"], "t1": lv["t1"], "t2": lv["t2"],
-                          "risk": lv["risk"], "tier": "core" if core_ok else "budget",
+                          "risk": lv["risk"], "tier": ("core" if core_ok else "budget" if budget_ok else "short"),
                           "cost_flags": flags})
                 c["score"] = score(c) + (0.20 if core_ok and c["expansion"] >= EXPANSION_REF else 0)
                 cands.append(c)
@@ -840,10 +847,11 @@ def render(cands, notes, vix, blocked, stats):
     L.append("Scanned %d names, %s contracts | %d cleared every gate"
              % (stats["names_done"], "{:,}".format(stats["contracts"]), len(cands)))
     if cands:
-        L.append("across %d names | %d core, %d budget"
+        L.append("across %d names | %d core, %d budget, %d short-dated"
                  % (len(set(c["symbol"] for c in cands)),
                     sum(1 for c in cands if c["tier"] == "core"),
-                    sum(1 for c in cands if c["tier"] == "budget")))
+                    sum(1 for c in cands if c["tier"] == "budget"),
+                    sum(1 for c in cands if c["tier"] == "short")))
     if stats["names_done"] < stats["names_total"]:
         L.append("_%d of %d names did not finish in time_"
                  % (stats["names_total"] - stats["names_done"], stats["names_total"]))
@@ -883,6 +891,8 @@ def render(cands, notes, vix, blocked, stats):
               % ("{:,}".format(BUDGET_MAX), "{:,}".format(CORE_MAX_COST)),
               "T1 reached by %.1f%% of %s similar trades in the 2025-26 test"
               % (HIT_CORE[0], "{:,}".format(HIT_CORE[1])), core)
+        sht = sorted([c for c in cands if c["tier"] == "short"],
+                     key=lambda x: -x["score"])[:MAX_SETUPS]
         flagged = any(b.get("cost_flags") for b in bud)
         block("BUDGET TIER   Rs %s-%s   short dated, higher risk"
               % ("{:,}".format(BUDGET_MIN), "{:,}".format(BUDGET_MAX)),
@@ -891,7 +901,12 @@ def render(cands, notes, vix, blocked, stats):
               if flagged else
               ("T1 reached by %.1f%% of %s similar trades - a base rate, not a forecast"
                % (HIT_BUDGET[0], "{:,}".format(HIT_BUDGET[1]))), bud)
-        if not core and not bud:
+        block("SHORT-DATED TIER   Rs %s-%s   8-30 days"
+              % ("{:,}".format(BUDGET_MAX), "{:,}".format(NEAR_MAX_COST)),
+              "LOSING CLASS: mean result -0.157R over %s trades, T1 reached %.1f%% of the time. "
+              "Shown because you asked to see it, not because it is good."
+              % ("{:,}".format(HIT_SHORT[1]), HIT_SHORT[0]), sht)
+        if not core and not bud and not sht:
             L.append("")
             L.append("<b>No qualifying setup today.</b> Nothing cleared every gate.")
 

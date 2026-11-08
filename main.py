@@ -71,6 +71,7 @@ MAX_SETUPS = 2                          # per tier
 EXPANSION_REF = 1.5                     # today's range vs its 20-day average
 SCAN_WORKERS = 4                        # NSE throttles hard above this
 SCAN_SECONDS = 420                      # hard budget; publish what finished
+RETRY_WAIT = 180                        # one retry if NSE returns nothing at all
 MIN_DTE_BUDGET = 8                      # budget tier cannot reach 31-60 days
 
 # Measured on NSE F&O bhavcopy, Jan-2025 to Nov-2026. These are historical
@@ -945,27 +946,36 @@ def main():
         return scan(local.nse, angel if angel_ok else None, lot_file,
                     symbol, is_index, m)
 
-    cands, notes, blockers = [], [], {}
-    done, total_scanned = 0, 0
-    t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        futs = {ex.submit(worker, item): item for item in universe}
-        for f in cf.as_completed(futs, timeout=None):
-            if time.time() - t0 > SCAN_SECONDS:
-                break
-            try:
-                c, sc, nt, bl = f.result()
-            except Exception as e:
-                log("scan failed:", futs[f][0], type(e).__name__)
-                continue
-            done += 1
-            total_scanned += sc
-            cands += c
-            notes += nt
-            for k, v in bl.items():
-                blockers[k] = blockers.get(k, 0) + v
-            if done % 25 == 0:
-                log("progress %d/%d" % (done, len(universe)))
+    def one_pass():
+        cs, nt_, bl_, dn, sc_ = [], [], {}, 0, 0
+        t0 = time.time()
+        with cf.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futs = {ex.submit(worker, item): item for item in universe}
+            for f in cf.as_completed(futs, timeout=None):
+                if time.time() - t0 > SCAN_SECONDS:
+                    break
+                try:
+                    c, sc, nt, bl = f.result()
+                except Exception as e:
+                    log("scan failed:", futs[f][0], type(e).__name__)
+                    continue
+                dn += 1
+                sc_ += sc
+                cs += c
+                nt_ += nt
+                for k, v in bl.items():
+                    bl_[k] = bl_.get(k, 0) + v
+                if dn % 25 == 0:
+                    log("progress %d/%d" % (dn, len(universe)))
+        return cs, nt_, bl_, dn, sc_
+
+    cands, notes, blockers, done, total_scanned = one_pass()
+    if done == 0:
+        # NSE sometimes blanks the chain during evening processing. One retry
+        # after a pause is cheaper than losing the whole day's scan.
+        log("no chains on the first pass; retrying once in %ds" % RETRY_WAIT)
+        time.sleep(RETRY_WAIT)
+        cands, notes, blockers, done, total_scanned = one_pass()
 
     stats = {"names_done": done, "names_total": len(universe),
              "contracts": total_scanned}

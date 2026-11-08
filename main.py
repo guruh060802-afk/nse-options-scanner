@@ -46,6 +46,7 @@ import sys
 import time
 
 import threading
+import urllib.parse
 
 import requests
 
@@ -347,7 +348,7 @@ class NSE:
         """(all dates, core picks, band). The raw list lets the budget tier reach nearer series."""
         kind = "Indices" if is_index else "Equity"
         info = self.json("https://www.nseindia.com/api/option-chain-contract-info"
-                         "?type=%s&symbol=%s" % (kind, symbol))
+                         "?type=%s&symbol=%s" % (kind, urllib.parse.quote(symbol, safe="")))
         if not info or not info.get("expiryDates"):
             return [], [], None
         picks, band = pick_expiries(info["expiryDates"])
@@ -356,7 +357,9 @@ class NSE:
     def chain(self, symbol, is_index, expiry):
         kind = "Indices" if is_index else "Equity"
         data = self.json("https://www.nseindia.com/api/option-chain-v3"
-                         "?type=%s&symbol=%s&expiry=%s" % (kind, symbol, expiry))
+                         "?type=%s&symbol=%s&expiry=%s"
+                         % (kind, urllib.parse.quote(symbol, safe=""),
+                            urllib.parse.quote(expiry, safe="")))
         if not data or "records" not in data:
             return None
         return data["records"]

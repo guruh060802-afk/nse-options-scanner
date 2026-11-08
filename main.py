@@ -504,8 +504,8 @@ def gates(c):
     # tested and is only marginally better per trade (+0.138R vs +0.119R) while
     # passing 40.5% of candidates against 90.5% - on a daily alert that strictness
     # produced empty scans, so only the own-side test is enforced.
-    if c["chg_oi_own"] <= 0:
-        bad.append("own side not gaining OI (%+d)" % c["chg_oi_own"])
+    if c["chg_oi_own"] < 0:
+        bad.append("own side losing OI (%+d)" % c["chg_oi_own"])
     if c["bid_qty"] < c["lot"] or c["ask_qty"] < c["lot"]:
         bad.append("depth %d/%d below one lot" % (c["bid_qty"], c["ask_qty"]))
     if c.get("rv") and c["iv"] > c["rv"] * IV_RV_MAX:

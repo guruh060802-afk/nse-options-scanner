@@ -54,6 +54,7 @@ import requests
 BUDGET_MIN, BUDGET_MAX = 3000, 7000     # rupees of capital per lot
 MIN_SESSIONS = 5                        # refuse final-week contracts
 MIN_DELTA, MAX_DELTA = 0.25, 0.60
+BUDGET_MIN_DELTA = 0.20                 # cheap contracts sit further out; relax only here
 TARGET_DELTA = 0.45
 MAX_THETA_PCT = 10.0                    # % of premium per calendar day
 T1_R, T2_R = 4.0, 6.0                   # target multiples the backtest supported
@@ -502,15 +503,16 @@ def build_levels(entry, atr, delta, theta, sessions, r1=None, r2=None):
 
 
 # --------------------------------------------------------------------- gates
-def gates(c):
+def gates(c, min_delta=None):
     """Every reason this contract is not publishable. Empty list means it passes."""
     bad = []
     if c["lot"] is None:
         bad.append("lot size unresolved")
     if c["cost"] is None or c["cost"] > CORE_MAX_COST:
         bad.append("cost Rs %s above the Rs %d core ceiling" % (c["cost"], CORE_MAX_COST))
-    if not (MIN_DELTA <= abs(c["delta"]) <= MAX_DELTA):
-        bad.append("delta %.3f outside %.2f-%.2f" % (abs(c["delta"]), MIN_DELTA, MAX_DELTA))
+    lo = MIN_DELTA if min_delta is None else min_delta
+    if not (lo <= abs(c["delta"]) <= MAX_DELTA):
+        bad.append("delta %.3f outside %.2f-%.2f" % (abs(c["delta"]), lo, MAX_DELTA))
     if c["premium"] > 0 and abs(c["theta"]) / c["premium"] * 100 > MAX_THETA_PCT:
         bad.append("theta %.1f%% of premium per day" % (abs(c["theta"]) / c["premium"] * 100))
     if c["spread_pct"] > MAX_SPREAD_PCT:
@@ -726,7 +728,8 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     "iv": g["iv"], "rv": (ind or {}).get("rv"),
                     "expansion": (ind or {}).get("expansion") or 0.0,
                 }
-                bad = gates(c)
+                cheap = BUDGET_MIN <= c["cost"] <= BUDGET_MAX
+                bad = gates(c, BUDGET_MIN_DELTA if cheap else None)
                 if bad:
                     for reason in bad:
                         k = blocker_key(reason)

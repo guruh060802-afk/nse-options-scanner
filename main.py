@@ -45,6 +45,8 @@ import random
 import sys
 import time
 
+import threading
+
 import requests
 
 # --------------------------------------------------------------------- config
@@ -64,6 +66,15 @@ MIN_OI = 100
 MIN_VOLUME_INDEX, MIN_VOLUME_STOCK = 500, 100
 STRIKE_WINDOW = 0.06
 MAX_SETUPS = 2                          # per tier
+EXPANSION_REF = 1.5                     # today's range vs its 20-day average
+SCAN_WORKERS = 4                        # NSE throttles hard above this
+SCAN_SECONDS = 420                      # hard budget; publish what finished
+MIN_DTE_BUDGET = 8                      # budget tier cannot reach 31-60 days
+
+# Measured on NSE F&O bhavcopy, Jan-2025 to Nov-2026. These are historical
+# base rates for the filter combination, NOT predictions for any single trade.
+HIT_CORE = (18.7, 1378)
+HIT_BUDGET = (15.0, 4882)
 CORE_MAX_COST = 20000                   # ceiling for the no-budget core tier
 MAX_EXPIRIES = 2                        # scan up to two series inside the band
 RISK_FREE = 0.065
@@ -77,7 +88,9 @@ INDEX_UNIVERSE = [
     {"symbol": "BANKNIFTY", "label": "Nifty Bank", "token": "99926009",
      "yahoo": "^NSEBANK"},
 ]
+# Fallback only - the live universe is read from NSE's own lot file.
 STOCK_WATCHLIST = ["HDFCBANK", "RELIANCE", "SBIN", "ICICIBANK"]
+INDEX_NAMES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -146,6 +159,7 @@ class Angel:
         self.session = requests.Session()
         self.headers = None
         self._tokens = {}
+        self._lock = threading.Lock()   # SmartAPI allows 3 req/s; serialise
 
     @property
     def enabled(self):
@@ -226,12 +240,14 @@ class Angel:
 
     def candles(self, symbol, is_index, index_token=None, days=140):
         """Daily OHLC candles. Returns [(high, low, close), ...] or []."""
-        token = self.token_for(symbol, is_index, index_token)
+        with self._lock:
+            token = self.token_for(symbol, is_index, index_token)
         if not token or not self.headers:
             return []
         end = now_ist()
         start = end - datetime.timedelta(days=days)
-        r = _request(self.session, "POST", ANGEL_BASE +
+        with self._lock:
+            r = _request(self.session, "POST", ANGEL_BASE +
                      "/rest/secure/angelbroking/historical/v1/getCandleData",
                      json={"exchange": "NSE", "symboltoken": token,
                            "interval": "ONE_DAY",
@@ -253,11 +269,12 @@ class Angel:
         return out
 
     def ltp(self, symbol, is_index, index_token=None, label=None):
-        token = self.token_for(symbol, is_index, index_token)
-        if not token or not self.headers:
-            return None
-        name = label or ("%s-EQ" % symbol.upper())
-        r = _request(self.session, "POST", ANGEL_BASE +
+        with self._lock:
+            token = self.token_for(symbol, is_index, index_token)
+            if not token or not self.headers:
+                return None
+            name = label or ("%s-EQ" % symbol.upper())
+            r = _request(self.session, "POST", ANGEL_BASE +
                      "/rest/secure/angelbroking/order/v1/getLtpData",
                      json={"exchange": "NSE", "tradingsymbol": name,
                            "symboltoken": token}, headers=self.headers)
@@ -327,14 +344,14 @@ class NSE:
         return None
 
     def expiries(self, symbol, is_index):
-        """Series inside the tested days-to-expiry band, widened if the band is empty."""
+        """(all dates, core picks, band). The raw list lets the budget tier reach nearer series."""
         kind = "Indices" if is_index else "Equity"
         info = self.json("https://www.nseindia.com/api/option-chain-contract-info"
                          "?type=%s&symbol=%s" % (kind, symbol))
         if not info or not info.get("expiryDates"):
-            return [], None
+            return [], [], None
         picks, band = pick_expiries(info["expiryDates"])
-        return [(e, sessions_left(e)) for e, _ in picks], band
+        return info["expiryDates"], [(e, sessions_left(e)) for e, _ in picks], band
 
     def chain(self, symbol, is_index, expiry):
         kind = "Indices" if is_index else "Equity"
@@ -415,8 +432,11 @@ def indicators(rows, atr_period=14, ema_fast=20, ema_slow=50):
         mean = sum(window) / len(window)
         var = sum((x - mean) ** 2 for x in window) / (len(window) - 1)
         rv = round(math.sqrt(var) * math.sqrt(252) * 100, 2)
+    trs_recent = trs[-20:]
+    expansion = round(trs[-1] / (sum(trs_recent) / len(trs_recent)), 2) if trs_recent and sum(trs_recent) > 0 else 0.0
     return {"atr": round(atr, 2), "ema_fast": round(ema(ema_fast), 2),
             "ema_slow": round(ema(ema_slow), 2), "rv": rv,
+            "expansion": expansion,
             "last_close": round(closes[-1], 2), "bars": len(rows)}
 
 
@@ -538,6 +558,23 @@ def score(c):
 
 
 # ------------------------------------------------------------------ calendar
+def universe_from_lot_file(lot_file):
+    """Every F&O underlying NSE lists, indices first. No hardcoded watchlist."""
+    if not lot_file:
+        return [(s, s in INDEX_NAMES) for s in INDEX_NAMES] + \
+               [(s, False) for s in STOCK_WATCHLIST]
+    seen, out = set(), []
+    for row in lot_file["rows"]:
+        sym = (row.get("SYMBOL") or "").strip().upper()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out.append((sym, sym in INDEX_NAMES))
+    idx = [x for x in out if x[1]]
+    stk = sorted([x for x in out if not x[1]])
+    return idx + stk
+
+
 def sessions_left(expiry):
     """Weekday sessions from now to expiry, inclusive. Today counts before 15:30 IST."""
     try:
@@ -599,76 +636,60 @@ def lot_for(symbol, expiry, lot_file):
 
 # ---------------------------------------------------------------------- scan
 def scan(nse, angel, lot_file, symbol, is_index, meta):
-    """Scan the next two tradeable series. Returns (contexts, setups, notes)."""
-    notes = []
-    expiries, band = nse.expiries(symbol, is_index)
-    if not expiries:
-        return [], [], ["%s: no expiry between %d and %d days"
-                        % (symbol, band[0], band[1])]
+    """Every qualifying contract for one underlying, flat. Returns (cands, scanned, notes)."""
+    all_dates, core_expiries, band = nse.expiries(symbol, is_index)
+    if not all_dates:
+        return [], 0, ["%s: no option chain" % symbol], {}
 
-    lot_note = ""
-    lot = None
-    candles = []
-    ind = None
-    source = "unavailable"
-    if angel:
-        candles = angel.candles(symbol, is_index, meta.get("token")) or []
-        source = "Angel One"
+    # core band first, then the nearest tradeable series for the budget tier
+    wanted = list(core_expiries)
+    for e in all_dates:
+        d = days_to_expiry(e)
+        if d is not None and d >= MIN_DTE_BUDGET and sessions_left(e) >= MIN_SESSIONS:
+            if e not in [x[0] for x in wanted]:
+                wanted.append((e, sessions_left(e)))
+            break
+    if not wanted:
+        return [], 0, ["%s: no expiry between %d and %d days" % (symbol, band[0], band[1])], {}
+
+    candles = angel.candles(symbol, is_index, meta.get("token")) if angel else []
+    source = "Angel One"
     if len(candles) < 60:
         ticker = (meta.get("yahoo") if is_index else symbol + ".NS") or symbol
         candles = yahoo_candles(ticker)
-        source = "Yahoo fallback"
+        source = "Yahoo"
     ind = indicators(candles)
+    notes = []
     if ind is None:
-        notes.append("%s: no usable candles, technicals skipped" % symbol)
+        notes.append("%s: no candles" % symbol)
 
-    contexts, setups = [], []
-    for expiry, sessions in expiries:
+    cands, scanned, blockers = [], 0, {}
+    for expiry, sessions in wanted[:MAX_EXPIRIES + 1]:
         rec = nse.chain(symbol, is_index, expiry)
         if not rec:
-            notes.append("%s %s: chain unavailable" % (symbol, expiry))
             continue
         spot = float(rec.get("underlyingValue") or 0)
         rows = rec.get("data") or []
         if not spot or not rows:
-            notes.append("%s %s: empty chain" % (symbol, expiry))
             continue
-
         lot, lot_note = lot_for(symbol, expiry, lot_file)
         if lot is None:
             notes.append("%s: %s" % (symbol, lot_note))
-
-        xcheck = None
-        if angel:
-            a = angel.ltp(symbol, is_index, meta.get("token"),
-                          label=meta.get("label") if is_index else None)
-            if a:
-                xcheck = round((a / spot - 1) * 100, 3)
-
+            continue
+        dte = days_to_expiry(expiry) or 0
         try:
             exp_dt = datetime.datetime.strptime(expiry, "%d-%b-%Y").replace(
                 hour=15, minute=30, tzinfo=IST)
             years = max((exp_dt - now_ist()).total_seconds(), 0) / (365 * 24 * 3600)
         except ValueError:
-            years = 0
+            continue
 
-        tot_ce = tot_pe = 0
-        for row in rows:
-            for side in ("CE", "PE"):
-                if side in row:
-                    oi = row[side].get("openInterest", 0) or 0
-                    if side == "CE":
-                        tot_ce += oi
-                    else:
-                        tot_pe += oi
-
-        passing, rejected, blockers = [], 0, {}
         for row in rows:
             strike = row.get("strikePrice")
             if not strike or abs(strike - spot) / spot > STRIKE_WINDOW:
                 continue
             for side in ("CE", "PE"):
-                if side not in row or lot is None:
+                if side not in row:
                     continue
                 o = row[side]
                 premium = float(o.get("lastPrice") or 0)
@@ -676,22 +697,20 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 ask = float(o.get("sellPrice1") or 0)
                 if premium <= 0 or bid <= 0 or ask <= 0 or ask < bid:
                     continue
+                scanned += 1
                 g = greeks(spot, strike, years,
                            float(o.get("impliedVolatility") or 0), side)
                 if not g:
                     continue
                 trend_ok = False
                 if ind:
-                    if side == "CE":
-                        trend_ok = spot > ind["ema_fast"] and spot > ind["ema_slow"]
-                    else:
-                        trend_ok = spot < ind["ema_fast"] and spot < ind["ema_slow"]
+                    trend_ok = (spot > ind["ema_fast"] and spot > ind["ema_slow"]) if side == "CE" \
+                               else (spot < ind["ema_fast"] and spot < ind["ema_slow"])
                 opp = row.get("PE" if side == "CE" else "CE", {})
                 c = {
-                    "symbol": symbol, "side": side, "strike": strike,
-                    "expiry": expiry, "sessions": sessions, "spot": spot,
-                    "premium": premium, "lot": lot,
-                    "cost": round(premium * lot, 2),
+                    "symbol": symbol, "side": side, "strike": strike, "expiry": expiry,
+                    "dte": dte, "sessions": sessions, "spot": spot, "premium": premium,
+                    "lot": lot, "cost": round(premium * lot, 2),
                     "spread_pct": round((ask - bid) / premium * 100, 2),
                     "oi": int(o.get("openInterest") or 0),
                     "chg_oi_own": int(o.get("changeinOpenInterest") or 0),
@@ -700,50 +719,31 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                     "bid_qty": int(o.get("totalBuyQuantity") or 0),
                     "ask_qty": int(o.get("totalSellQuantity") or 0),
                     "min_volume": MIN_VOLUME_INDEX if is_index else MIN_VOLUME_STOCK,
-                    "trend_ok": trend_ok, "delta": g["delta"],
-                    "theta": g["theta"], "iv": g["iv"],
-                    "rv": (ind or {}).get("rv"),
+                    "trend_ok": trend_ok, "delta": g["delta"], "theta": g["theta"],
+                    "iv": g["iv"], "rv": (ind or {}).get("rv"),
+                    "expansion": (ind or {}).get("expansion") or 0.0,
                 }
                 bad = gates(c)
                 if bad:
-                    rejected += 1
                     for reason in bad:
-                        key = blocker_key(reason)
-                        blockers[key] = blockers.get(key, 0) + 1
+                        k = blocker_key(reason)
+                        blockers[k] = blockers.get(k, 0) + 1
+                    continue
+                if c["cost"] > CORE_MAX_COST:
+                    continue
+                core_ok = MIN_DTE <= dte <= MAX_DTE and c["cost"] > BUDGET_MAX
+                budget_ok = BUDGET_MIN <= c["cost"] <= BUDGET_MAX and dte >= MIN_DTE_BUDGET
+                if not (core_ok or budget_ok):
                     continue
                 lv = build_levels(premium, (ind or {}).get("atr") or 0,
                                   g["delta"], g["theta"], sessions)
-                if not lv:
-                    rejected += 1
+                if not lv or not lv["feasible"]:
                     continue
-                if not lv["feasible"]:
-                    rejected += 1
-                    blockers["T1 move beyond ATR budget"] = blockers.get(
-                        "T1 move beyond ATR budget", 0) + 1
-                    continue
-                c["levels"] = lv
-                c["score"] = score(c)
-                c["tier"] = ("budget" if BUDGET_MIN <= c["cost"] <= BUDGET_MAX
-                             else "core")
-                passing.append(c)
-
-        contexts.append({
-            "symbol": symbol, "spot": spot, "stamp": rec.get("timestamp", ""),
-            "expiry": expiry, "sessions": sessions, "lot": lot,
-            "lot_note": lot_note,
-            "pcr": round(tot_pe / tot_ce, 2) if tot_ce else 0.0,
-            "resistance": top_strike(rows, "CE"),
-            "support": top_strike(rows, "PE", exclude=top_strike(rows, "CE")),
-            "atr": (ind or {}).get("atr"), "ema_fast": (ind or {}).get("ema_fast"),
-            "ema_slow": (ind or {}).get("ema_slow"), "candle_source": source,
-            "bars": (ind or {}).get("bars"), "rv": (ind or {}).get("rv"),
-            "band": band, "angel_xcheck_pct": xcheck,
-            "scanned": len(passing) + rejected, "rejected": rejected,
-            "blockers": sorted(blockers.items(), key=lambda kv: -kv[1])[:3],
-        })
-        setups += passing
-
-    return contexts, setups, notes
+                c.update({"levels": lv, "sl": lv["sl"], "t1": lv["t1"], "t2": lv["t2"],
+                          "risk": lv["risk"], "tier": "core" if core_ok else "budget"})
+                c["score"] = score(c) + (0.20 if core_ok and c["expansion"] >= EXPANSION_REF else 0)
+                cands.append(c)
+    return cands, scanned, notes, blockers
 
 
 def top_strike(rows, side, exclude=None):
@@ -812,84 +812,75 @@ def telegram(token, chat_id, text):
 
 
 # ------------------------------------------------------------------- message
-def render(results, budget, core, notes, vix, blocked):
+def render(cands, notes, vix, blocked, stats):
     now = now_ist()
-    lines = ["<b>NSE option-buying scan</b>  %s" % now.strftime("%d-%b-%Y %H:%M IST")]
+    L = ["<b>NSE option-buying scan</b>  %s" % now.strftime("%d-%b-%Y %H:%M IST")]
     if vix is not None:
-        lines.append("India VIX %s" % vix)
+        L.append("India VIX %s" % vix)
+    L.append("")
+    L.append("Scanned %d names, %s contracts | %d cleared every gate"
+             % (stats["names_done"], "{:,}".format(stats["contracts"]), len(cands)))
+    if cands:
+        L.append("across %d names | %d core, %d budget"
+                 % (len(set(c["symbol"] for c in cands)),
+                    sum(1 for c in cands if c["tier"] == "core"),
+                    sum(1 for c in cands if c["tier"] == "budget")))
+    if stats["names_done"] < stats["names_total"]:
+        L.append("_%d of %d names did not finish in time_"
+                 % (stats["names_total"] - stats["names_done"], stats["names_total"]))
 
-    by_symbol = {}
-    for r in results:
-        by_symbol.setdefault(r["context"]["symbol"], []).append(r["context"])
-
-    for symbol, ctxs in by_symbol.items():
-        head = ctxs[0]
-        expiries = " + ".join("%s (%d)" % (c["expiry"], c["sessions"]) for c in ctxs)
-        scanned = sum(c["scanned"] for c in ctxs)
-        passed = sum(c["scanned"] - c["rejected"] for c in ctxs)
-        lines.append("")
-        lines.append("<b>%s</b> %s   PCR %s   S %s / R %s"
-                     % (esc(symbol), esc("{:,.2f}".format(head["spot"])),
-                        head["pcr"], head["support"], head["resistance"]))
-        lines.append("  %s | lot %s | ATR %s | RV20 %s | %s | scanned %d, passed %d"
-                     % (esc(expiries), head["lot"], head["atr"], head["rv"],
-                        esc(head["candle_source"]), scanned, passed))
-        if head["angel_xcheck_pct"] is not None:
-            lines.append("  Angel vs NSE spot %+.3f%% | chain %s"
-                         % (head["angel_xcheck_pct"], esc(head["stamp"])))
-        if not passed:
-            agg = {}
-            for c in ctxs:
-                for key, n in c.get("blockers", []):
-                    agg[key] = agg.get(key, 0) + n
-            if agg:
-                top = sorted(agg.items(), key=lambda kv: -kv[1])[:3]
-                lines.append("  blocked by: %s"
-                             % ", ".join("%s %d" % (k, v) for k, v in top))
-
-    def block(title, rows):
+    def block(title, sub, rows):
         if not rows:
             return
-        lines.append("")
-        lines.append("<b>%s</b>" % title)
+        L.append("")
+        L.append("<b>%s</b>" % title)
+        L.append("<i>%s</i>" % sub)
         for s in rows:
-            lv = s["levels"]
-            lines.append("")
-            lines.append("<b>%s %d %s</b>  %s, %d sessions"
-                         % (esc(s["symbol"]), s["strike"], s["side"],
-                            esc(s["expiry"]), s["sessions"]))
-            lines.append("Entry %s | SL %s | T1 %s (%.2fR) | T2 %s (%.2fR)"
-                         % (lv["entry"], lv["sl"], lv["t1"], lv["t1_rr"],
-                            lv["t2"], lv["t2_rr"]))
-            lines.append("Cost Rs %s = %s x %d | risk Rs %s per lot"
-                         % (int(s["cost"]), s["premium"], s["lot"],
-                            int(round(lv["risk"] * s["lot"]))))
-            lines.append("delta %.3f | theta %.2f/day | IV %.1f vs RV %.1f | spread %.2f%%"
-                         % (s["delta"], s["theta"], s["iv"], s.get("rv") or 0,
-                            s["spread_pct"]))
-            lines.append("T1 needs a %.0f pt move; ATR budget %.0f | OI %s | dOI %+d | vol %s | score %.2f"
-                         % (lv["move_t1"], lv["move_budget"], "{:,}".format(s["oi"]),
-                            s["chg_oi_own"], "{:,}".format(s["volume"]), s["score"]))
+            L.append("")
+            L.append("<b>%s %d %s</b>  %s, %d days" % (esc(s["symbol"]), s["strike"],
+                     s["side"], esc(s["expiry"]), s["dte"]))
+            L.append("Entry %s | SL %s | T1 %s (4R) | T2 %s (6R)"
+                     % (s["premium"], s["sl"], s["t1"], s["t2"]))
+            L.append("Cost Rs %s = %s x %d | risk Rs %s per lot"
+                     % ("{:,}".format(int(s["cost"])), s["premium"], s["lot"],
+                        "{:,}".format(int(round(s["risk"] * s["lot"])))))
+            L.append("delta %.3f | theta %.2f/day | IV %.1f vs RV %.1f | spread %.2f%%"
+                     % (s["delta"], s["theta"], s["iv"], s["rv"] or 0, s["spread_pct"]))
+            L.append("range %.2fx | OI %s | dOI %+d | vol %s"
+                     % (s["expansion"], "{:,}".format(s["oi"]), s["chg_oi_own"],
+                        "{:,}".format(s["volume"])))
 
     if blocked:
-        lines.append("")
-        lines.append("<b>No setups published.</b> %s" % esc(blocked))
+        L.append("")
+        L.append("<b>Nothing published.</b> %s" % esc(blocked))
     else:
-        block("Budget tier  Rs %d-%d per lot" % (BUDGET_MIN, BUDGET_MAX), budget)
-        block("Core tier  above budget, under Rs %d" % CORE_MAX_COST, core)
-        if not budget and not core:
-            lines.append("")
-            lines.append("<b>No qualifying setup today.</b> Nothing cleared every "
-                         "gate. The blockers above are the reason.")
+        core = sorted([c for c in cands if c["tier"] == "core"],
+                      key=lambda x: -x["score"])[:MAX_SETUPS]
+        bud = sorted([c for c in cands if c["tier"] == "budget"],
+                     key=lambda x: -x["score"])[:MAX_SETUPS]
+        block("CORE TIER   Rs %s-%s   31-60 days"
+              % ("{:,}".format(BUDGET_MAX), "{:,}".format(CORE_MAX_COST)),
+              "T1 reached by %.1f%% of %s similar trades in the 2025-26 test"
+              % (HIT_CORE[0], "{:,}".format(HIT_CORE[1])), core)
+        block("BUDGET TIER   Rs %s-%s   short dated, higher risk"
+              % ("{:,}".format(BUDGET_MIN), "{:,}".format(BUDGET_MAX)),
+              "T1 reached by %.1f%% of %s similar trades - a base rate, not a forecast"
+              % (HIT_BUDGET[0], "{:,}".format(HIT_BUDGET[1])), bud)
+        if not core and not bud:
+            L.append("")
+            L.append("<b>No qualifying setup today.</b> Nothing cleared every gate.")
 
     if notes:
-        lines.append("")
-        lines.append("<i>%s</i>" % esc("; ".join(notes)))
-    return "\n".join(lines)
+        L.append("")
+        L.append("<i>%s</i>" % esc("; ".join(notes[:6])))
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------------- main
 def main():
+    import concurrent.futures as cf
+    import threading
+
     dry = (os.getenv("DRY_RUN") or "").strip().lower() in ("1", "true", "yes")
     token = env("TG_BOT_TOKEN")
     chat_id = env("TG_CHAT_ID")
@@ -902,46 +893,58 @@ def main():
     lot_file = nse.lot_file()
     vix = nse.vix()
 
-    results, setups, notes = [], [], []
+    universe = universe_from_lot_file(lot_file)
     meta = {i["symbol"]: i for i in INDEX_UNIVERSE}
+    local = threading.local()
 
-    for item in INDEX_UNIVERSE:
-        ctxs, found, note = scan(nse, angel if angel_ok else None, lot_file,
-                                 item["symbol"], True, item)
-        notes += note
-        if not ctxs:
-            notes.append("%s not scanned" % item["symbol"])
-        results += [{"context": c} for c in ctxs]
-        setups += found
+    def worker(item):
+        symbol, is_index = item
+        if not hasattr(local, "nse"):
+            local.nse = NSE()
+        m = meta.get(symbol, {})
+        return scan(local.nse, angel if angel_ok else None, lot_file,
+                    symbol, is_index, m)
 
-    for symbol in STOCK_WATCHLIST:
-        ctxs, found, note = scan(nse, angel if angel_ok else None, lot_file,
-                                 symbol, False, {})
-        notes += note
-        if not ctxs:
-            notes.append("%s not scanned" % symbol)
-        results += [{"context": c} for c in ctxs]
-        setups += found
+    cands, notes, blockers = [], [], {}
+    done, total_scanned = 0, 0
+    t0 = time.time()
+    with cf.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        futs = {ex.submit(worker, item): item for item in universe}
+        for f in cf.as_completed(futs, timeout=None):
+            if time.time() - t0 > SCAN_SECONDS:
+                break
+            try:
+                c, sc, nt, bl = f.result()
+            except Exception as e:
+                log("scan failed:", futs[f][0], type(e).__name__)
+                continue
+            done += 1
+            total_scanned += sc
+            cands += c
+            notes += nt
+            for k, v in bl.items():
+                blockers[k] = blockers.get(k, 0) + v
+            if done % 25 == 0:
+                log("progress %d/%d" % (done, len(universe)))
 
+    stats = {"names_done": done, "names_total": len(universe),
+             "contracts": total_scanned}
     blocked = None
-    if not results:
-        blocked = ("No option chain could be retrieved from NSE, so nothing is "
-                   "being published. This is a feed failure, not an empty scan.")
+    if done == 0:
+        blocked = ("No option chain could be retrieved from NSE. This is a feed "
+                   "failure, not an empty scan.")
     elif vix is not None and vix > VIX_BLOCK:
-        blocked = ("India VIX is above %.0f. New positional long-premium entries "
-                   "are suppressed at this volatility." % VIX_BLOCK)
-        setups = []
+        blocked = ("India VIX is above %.0f. New positional entries are suppressed "
+                   "at this volatility." % VIX_BLOCK)
+        cands = []
 
-    setups.sort(key=lambda s: s["score"], reverse=True)
-    budget = [s for s in setups if s["tier"] == "budget"][:MAX_SETUPS]
-    core = [s for s in setups if s["tier"] == "core"][:MAX_SETUPS]
-
-    text = render(results, budget, core, notes, vix, blocked)
+    log("blockers:", sorted(blockers.items(), key=lambda kv: -kv[1])[:5])
+    text = render(cands, notes, vix, blocked, stats)
     print(text)
-    if not dry:
-        telegram(token, chat_id, text)
-    else:
+    if dry:
         log("dry run: nothing sent")
+    else:
+        telegram(token, chat_id, text)
 
 
 if __name__ == "__main__":

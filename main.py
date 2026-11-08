@@ -730,11 +730,19 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 }
                 cheap = BUDGET_MIN <= c["cost"] <= BUDGET_MAX
                 bad = gates(c, BUDGET_MIN_DELTA if cheap else None)
+                flags = []
                 if bad:
-                    for reason in bad:
-                        k = blocker_key(reason)
-                        blockers[k] = blockers.get(k, 0) + 1
-                    continue
+                    # A cheap contract that fails ONLY on spread or volume is still
+                    # shown in the budget tier, but labelled - never silently promoted.
+                    cost_only = [r for r in bad if r.startswith(("spread", "volume"))]
+                    other = [r for r in bad if r not in cost_only]
+                    if cheap and cost_only and not other:
+                        flags = cost_only
+                    else:
+                        for reason in bad:
+                            k = blocker_key(reason)
+                            blockers[k] = blockers.get(k, 0) + 1
+                        continue
                 if c["cost"] > CORE_MAX_COST:
                     continue
                 core_ok = MIN_DTE <= dte <= MAX_DTE and c["cost"] > BUDGET_MAX
@@ -750,7 +758,8 @@ def scan(nse, angel, lot_file, symbol, is_index, meta):
                 if not lv or not lv["feasible"]:
                     continue
                 c.update({"levels": lv, "sl": lv["sl"], "t1": lv["t1"], "t2": lv["t2"],
-                          "risk": lv["risk"], "tier": "core" if core_ok else "budget"})
+                          "risk": lv["risk"], "tier": "core" if core_ok else "budget",
+                          "cost_flags": flags})
                 c["score"] = score(c) + (0.20 if core_ok and c["expansion"] >= EXPANSION_REF else 0)
                 cands.append(c)
     return cands, scanned, notes, blockers
@@ -859,6 +868,8 @@ def render(cands, notes, vix, blocked, stats):
             L.append("range %.2fx | OI %s | dOI %+d | vol %s"
                      % (s["expansion"], "{:,}".format(s["oi"]), s["chg_oi_own"],
                         "{:,}".format(s["volume"])))
+            if s.get("cost_flags"):
+                L.append("<b>! %s</b>" % esc("; ".join(s["cost_flags"])))
 
     if blocked:
         L.append("")
@@ -867,15 +878,19 @@ def render(cands, notes, vix, blocked, stats):
         core = sorted([c for c in cands if c["tier"] == "core"],
                       key=lambda x: -x["score"])[:MAX_SETUPS]
         bud = sorted([c for c in cands if c["tier"] == "budget"],
-                     key=lambda x: -x["score"])[:MAX_SETUPS]
+                     key=lambda x: (bool(x.get("cost_flags")), -x["score"]))[:MAX_SETUPS]
         block("CORE TIER   Rs %s-%s   31-60 days"
               % ("{:,}".format(BUDGET_MAX), "{:,}".format(CORE_MAX_COST)),
               "T1 reached by %.1f%% of %s similar trades in the 2025-26 test"
               % (HIT_CORE[0], "{:,}".format(HIT_CORE[1])), core)
+        flagged = any(b.get("cost_flags") for b in bud)
         block("BUDGET TIER   Rs %s-%s   short dated, higher risk"
               % ("{:,}".format(BUDGET_MIN), "{:,}".format(BUDGET_MAX)),
-              "T1 reached by %.1f%% of %s similar trades - a base rate, not a forecast"
-              % (HIT_BUDGET[0], "{:,}".format(HIT_BUDGET[1])), bud)
+              ("FAILS THE COST TEST - shown for visibility, do not take without checking the live spread. "
+               "T1 reached by %.1f%% of %s similar trades" % (HIT_BUDGET[0], "{:,}".format(HIT_BUDGET[1])))
+              if flagged else
+              ("T1 reached by %.1f%% of %s similar trades - a base rate, not a forecast"
+               % (HIT_BUDGET[0], "{:,}".format(HIT_BUDGET[1]))), bud)
         if not core and not bud:
             L.append("")
             L.append("<b>No qualifying setup today.</b> Nothing cleared every gate.")
